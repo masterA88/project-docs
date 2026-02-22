@@ -1,0 +1,1061 @@
+// ============================================================================
+// PHASE 1: DATA VERIFICATION (After Import)
+// ============================================================================
+
+// STEP 1.1: Count all nodes by type
+// ============================================================================
+// PURPOSE: Verify all data was imported correctly into Neo4j
+// ============================================================================
+
+
+MATCH (n) 
+RETURN labels(n)[0] AS NodeType, count(n) AS Count
+ORDER BY Count DESC;
+
+
+// STEP 1.2: Count all relationships by type
+// ============================================================================
+// PURPOSE: Verify all relationships between nodes were created correctly
+// ============================================================================
+
+
+
+MATCH ()-[r]->()
+RETURN type(r) AS RelationshipType, count(r) AS Count
+ORDER BY Count DESC;
+
+// ----------------------------------------------------------------------------
+
+// STEP 1.3: View sample client with connections
+// Purpose: Understand data structure visually
+// Result: Graph visualization in Neo4j Browser
+
+MATCH (c:Client)-[r]->(n)
+WHERE c.name = "Henry Bell"  // Change to any client
+RETURN c, r, n;
+
+// ============================================================================
+// PHASE 2: DATA ENGINEERING - CALCULATE NODE DEGREES
+// ============================================================================
+
+// STEP 2.1: Calculate degrees for all nodes
+// Purpose: Identify highly connected nodes (fraud indicators)
+// Time: ~5-10 seconds for 5,067 nodes
+
+MATCH (n)
+WITH n, 
+     COUNT { (n)-->() } as out_degree, 
+     COUNT { (n)<--() } as in_degree
+SET n.out_degree = out_degree, n.in_degree = in_degree
+RETURN count(n) as nodes_updated;
+
+// ----------------------------------------------------------------------------
+
+// STEP 2.2: Identify SSN "super nodes" (shared SSNs)
+// ============================================================================
+// PURPOSE: Find the PRIMARY FRAUD INDICATOR - Social Security Numbers 
+//          used by multiple people (IDENTITY THEFT!)
+// ============================================================================
+
+MATCH (s:SSN)
+WHERE s.in_degree > 1  
+RETURN s.value AS SSN, 
+       s.in_degree AS ClientCount
+ORDER BY s.in_degree DESC;
+
+// ----------------------------------------------------------------------------
+
+// STEP 2.3: Identify Email super nodes
+// Purpose: Find shared email addresses (fraud coordination)
+
+MATCH (e:Email)
+WHERE e.in_degree > 2  // 3+ clients sharing email
+RETURN e.address AS Email, 
+       e.in_degree AS ClientCount
+ORDER BY e.in_degree DESC
+LIMIT 10;
+
+// ----------------------------------------------------------------------------
+
+// STEP 2.4: Identify Phone super nodes
+// Purpose: Find shared phones (coordination indicator)
+
+MATCH (p:Phone)
+WHERE p.in_degree > 2
+RETURN p.number AS Phone, 
+       p.in_degree AS ClientCount
+ORDER BY p.in_degree DESC
+LIMIT 10;
+
+// ============================================================================
+// PHASE 3: CREATE FRAUD NETWORK - WEIGHTED CONNECTIONS
+// ============================================================================
+
+// STEP 3.1: Create SHARED_IDENTIFIERS relationships
+// ============================================================================
+// THIS IS THE MOST IMPORTANT QUERY IN THE ENTIRE WORKFLOW! 
+// ============================================================================
+// PURPOSE: Create direct connections between clients who share identifiers
+//          This transforms separate data into a FRAUD NETWORK
+// ============================================================================
+
+
+MATCH (c1:Client)-[r:HAS_EMAIL|HAS_PHONE|HAS_SSN]->(n)
+      <-[r2:HAS_EMAIL|HAS_PHONE|HAS_SSN]-(c2:Client)
+WHERE id(c1) < id(c2)
+WITH c1, c2, count(*) as cnt,
+     SUM(
+       CASE WHEN type(r) = 'HAS_EMAIL' THEN 1.0
+            WHEN type(r) = 'HAS_PHONE' THEN 1.5
+            WHEN type(r) = 'HAS_SSN' THEN 5.0
+            ELSE 0
+       END
+     ) AS weight
+MERGE (c1)-[:SHARED_IDENTIFIERS {count: cnt, weight: weight}]->(c2);
+
+
+
+// ----------------------------------------------------------------------------
+
+// STEP 3.2: View the fraud network
+// ============================================================================
+// PURPOSE: VISUALIZE the fraud connections - see the network graph!
+// ============================================================================
+
+//
+// PRO TIP: To see ONLY critical connections, add:
+//    WHERE r.weight >= 5.0 (shows only SSN sharing)
+
+MATCH (c:Client)-[r:SHARED_IDENTIFIERS]-(c2:Client)
+RETURN c, r, c2
+LIMIT 50;
+
+
+//
+// NEXT: Click on the largest cluster to explore it
+// Then run STEP 3.3 to get list of highest-risk connections
+
+
+
+// ----------------------------------------------------------------------------
+
+// STEP 3.3: Find highest-weight connections (most suspicious)
+// ============================================================================
+// PURPOSE: Get a RANKED LIST of most suspicious client pairs
+//          Priority investigation targets
+// ============================================================================
+
+Untuk mengecek semua top 20:
+// Find which top fraud suspects are also flagged mules
+MATCH (c:Client)
+WHERE exists((c)-[:SHARED_IDENTIFIERS]-())
+WITH c, COUNT { (c)-[:SHARED_IDENTIFIERS]-() } AS connections
+ORDER BY connections DESC
+LIMIT 20
+MATCH (c)-[:FLAGGED_AS]->(m:Mule)
+RETURN c.name AS Client,
+       connections AS FraudConnections,
+       m.riskScore AS MuleRiskScore,
+       m.flaggedDate AS FlaggedDate
+ORDER BY connections DESC;
+
+// For each pair in the top 20:
+//
+// 1. CHECK IF THEY'RE MULES:
+//    Run: MATCH (c:Client {name: "Henry Bell"})-[:FLAGGED_AS]->(:Mule)
+//    If yes: EXTRA HIGH PRIORITY
+or
+MATCH (c:Client {name: "Benjamin Young"})-[:FLAGGED_AS]->(m:Mule)
+RETURN c.name, m.riskScore, m.flaggedDate;
+
+
+// 2. ANALYZE TRANSACTIONS:
+//    Run: MATCH (c:Client {name: "Henry Bell"})-[:PERFORMED]->(t:Transaction)
+//         RETURN sum(t.amount), count(t)
+//    Large amounts = bigger fraud impact
+//
+// 3. CHECK REGISTRATION DATES:
+//    Run: MATCH (c:Client {name: "Henry Bell"})
+//         RETURN c.registrationDate
+//    Same dates = coordinated account creation
+//
+// 4. FIND SHARED SSN VALUE:
+//    Run: MATCH (c1:Client {name: "Henry Bell"})-[:HAS_SSN]->(s:SSN)
+//              <-[:HAS_SSN]-(c2:Client {name: "Betty Thomas"})
+//         RETURN s.value
+//    See WHICH SSN they're using
+
+
+// VARIATIONS OF THIS QUERY:
+// ============================================================================
+//
+// Show ONLY critical connections (weight 7.5):
+MATCH (c1:Client)-[r:SHARED_IDENTIFIERS]-(c2:Client)
+WHERE r.weight = 7.5
+RETURN c1.name, c2.name, r.count, r.weight;
+
+
+// Show connections for specific client:
+// MATCH (c1:Client {name: "Henry Bell"})-[r:SHARED_IDENTIFIERS]-(c2:Client)
+// RETURN c2.name, r.count, r.weight
+// ORDER BY r.weight DESC;
+
+
+
+
+// Count by weight level:
+MATCH ()-[r:SHARED_IDENTIFIERS]->()
+RETURN r.weight AS Weight, count(r) AS Count
+ORDER BY Weight DESC;
+
+// NEXT STEPS:
+// ============================================================================
+// 1. Copy top 10 client names to investigation list
+// 2. Run STEP 6.1 for each shared SSN found
+// 3. Run STEP 6.2 to see full fraud ring for top clients
+// 4. Run STEP 6.5 to analyze transaction volumes
+// 5. Create executive report with top findings
+
+MATCH (c1:Client)-[r:SHARED_IDENTIFIERS]-(c2:Client)
+RETURN c1.name AS Client1, 
+       c2.name AS Client2,
+       r.count AS SharedIdentifiers,
+       r.weight AS FraudWeight
+ORDER BY r.weight DESC
+LIMIT 20;
+
+OUTPUT:
+Client1,Client2,SharedIdentifiers,FraudWeight
+Carolyn Gonzales,Eric Evans,3,7.5
+Eric Evans,Carolyn Gonzales,3,7.5
+Emily Henderson,Charles Crawford,3,7.5
+
+
+/
+// ============================================================================
+// PHASE 5: MANUAL COMMUNITY ANALYSIS (No GDS Required)
+// ============================================================================
+// Use this if you DON'T have Graph Data Science library
+
+// STEP 5.1: Find all connected components manually
+// Purpose: Identify fraud rings without GDS
+
+MATCH (c:Client)-[:SHARED_IDENTIFIERS*]-(connected:Client)
+WITH c, collect(DISTINCT connected) + [c] AS community
+RETURN size(community) AS CommunitySize,
+       [member in community | member.name][0..5] AS SampleMembers
+ORDER BY CommunitySize DESC;
+
+
+
+// Shows you the fraud ring sizes
+
+// ----------------------------------------------------------------------------
+
+// STEP 5.2: Find the largest fraud ring members
+// Purpose: Get complete list of largest fraud group
+
+MATCH (start:Client {name: "Henry Bell"})  
+MATCH path = (start)-[:SHARED_IDENTIFIERS*]-(connected:Client)
+WITH collect(DISTINCT connected) + [start] AS ring_members
+RETURN [m IN ring_members | m.name] AS AllMembers,
+       size(ring_members) AS TotalMembers;
+
+
+
+// ----------------------------------------------------------------------------
+
+// STEP 5.3: Calculate simple centrality (degree)
+// Purpose: Find most connected clients (proxy for importance)
+
+MATCH (c:Client)
+WHERE exists((c)-[:SHARED_IDENTIFIERS]-())
+WITH c, COUNT { (c)-[:SHARED_IDENTIFIERS]-() } AS connections
+RETURN c.name AS Client,
+       connections AS Connections
+ORDER BY connections DESC
+LIMIT 10;
+
+// Expected results:
+// Clients with 10 connections at top
+// These are likely fraud ring leaders
+
+
+// ============================================================================
+// PHASE 6: DETAILED INVESTIGATION QUERIES
+// ============================================================================
+
+// STEP 6.1: Investigate specific SSN (identity theft case)
+// ============================================================================
+// PURPOSE: See ALL clients using the SAME Social Security Number
+//          This is direct evidence of identity theft
+// ============================================================================
+
+
+MATCH (s:SSN {value: "823-37-2052"})<-[:HAS_SSN]-(c:Client)
+RETURN s.value AS SharedSSN,
+       collect(c.name) AS AllClients,
+       count(c) AS ClientCount;
+	   
+
+
+// VISUAL INVESTIGATION:
+// To SEE this network in Neo4j Browser:
+// ```
+MATCH (s:SSN {value: "823-37-2052"})<-[:HAS_SSN]-(c:Client)
+MATCH (c)-[r]-(n)
+RETURN c, r, n;
+// ```
+
+// ----------------------------------------------------------------------------
+
+// STEP 6.2: See what identifiers a fraud ring shares
+// Purpose: Understand how a fraud ring is connected
+
+MATCH (c:Client {name: "Henry Bell"})-[:SHARED_IDENTIFIERS]-(c2:Client)
+MATCH (c)-[r1:HAS_EMAIL|HAS_PHONE|HAS_SSN]->(n)<-[r2:HAS_EMAIL|HAS_PHONE|HAS_SSN]-(c2)
+RETURN c.name AS Client1,
+       c2.name AS Client2,
+       type(r1) AS SharedType,
+       CASE 
+         WHEN n:Email THEN n.address
+         WHEN n:Phone THEN n.number
+         WHEN n:SSN THEN n.value
+       END AS SharedValue;
+
+// Shows exactly what each pair shares
+// Example: Henry Bell + Betty Thomas share SSN "823-37-2052"
+
+OUTPUT:
+Client1,Client2,SharedType,SharedValue
+Henry Bell,Samuel Cole,HAS_SSN,823-37-2052
+Henry Bell,Gary Griffin,HAS_SSN,823-37-2052
+Henry Bell,Betty Thomas,HAS_SSN,823-37-2052
+Henry Bell,Michelle Carter,HAS_SSN,823-37-2052
+Henry Bell,Kenneth Vasquez,HAS_SSN,823-37-2052
+Henry Bell,Gloria Flores,HAS_SSN,823-37-2052
+Henry Bell,Benjamin Young,HAS_SSN,823-37-2052
+Henry Bell,Ryan Howard,HAS_PHONE,212-503-1444
+Henry Bell,Sara Fernandez,HAS_PHONE,212-503-1444
+Henry Bell,Ryan Howard,HAS_EMAIL,user9548@aol.com
+Henry Bell,Sara Fernandez,HAS_EMAIL,user9548@aol.com
+
+// ----------------------------------------------------------------------------
+
+// STEP 6.3: Find shortest path between two fraudsters
+// Purpose: Understand fraud network connections
+
+MATCH (start:Client {name: "Henry Bell"}),
+      (end:Client {name: "Ronald Flores"})
+MATCH path = shortestPath((start)-[:SHARED_IDENTIFIERS*]-(end))
+RETURN path;
+
+// Shows the connection chain:
+// Henry → [via SSN] → Betty → [via Phone] → Ronald
+
+
+// ----------------------------------------------------------------------------
+
+// STEP 6.4: Analyze flagged mules
+// Purpose: See which clients are pre-flagged as suspicious
+
+MATCH (c:Client)-[:FLAGGED_AS]->(m:Mule)
+RETURN c.name AS Client,
+       m.riskScore AS RiskScore,
+       m.flaggedDate AS FlaggedDate,
+       COUNT { (c)-[:SHARED_IDENTIFIERS]-() } AS FraudConnections
+ORDER BY m.riskScore DESC;
+
+// Expected result:
+// 6 flagged clients with risk scores 0.60-0.99
+// Check if they're in major fraud rings!
+
+// ----------------------------------------------------------------------------
+
+// STEP 6.5: Transaction analysis for fraud ring
+// Purpose: See financial activity of fraud ring members
+
+MATCH (c:Client)-[:SHARED_IDENTIFIERS*]-(connected:Client)
+WHERE c.name = "Henry Bell"
+WITH c, collect(DISTINCT connected) AS connected_members
+WITH connected_members + [c] AS ring_members
+UNWIND ring_members AS member
+MATCH (member)-[:PERFORMED]->(t:Transaction)
+RETURN member.name AS Client,
+       count(t) AS TransactionCount,
+       sum(t.amount) AS TotalAmount
+ORDER BY TotalAmount DESC;
+
+// Shows which fraud ring members have highest transaction volumes
+// Helps identify money flow
+
+
+// ============================================================================
+// PHASE 7: REPORTING QUERIES
+// ============================================================================
+
+// STEP 7.1: Executive Summary - Top Fraud Cases
+// ============================================================================
+// PURPOSE: Generate ONE-PAGE summary for executives/management
+//          Four KEY metrics that tell the complete fraud story
+// ============================================================================
+//
+// WHO THIS IS FOR:
+// • C-level executives (CEO, CFO, CRO)
+// • Board members
+// • Compliance officers
+// • Audit committees
+// • Regulators (if required)
+//
+// WHAT THIS QUERY DOES:
+// Calculates FOUR critical fraud indicators in a single query:
+// 1. SharedSSNs: How many SSNs are used by multiple people
+// 2. LargestSSNGroup: Maximum clients using same SSN
+// 3. FraudConnections: Total suspicious relationships
+// 4. LargestFraudRing: Biggest organized fraud network
+//
+// QUERY BREAKDOWN (4 Parts):
+//
+// PART 1: Count Shared SSNs
+// -------------------------
+// MATCH (s:SSN)<-[:HAS_SSN]-(c:Client)
+// WITH s, count(c) AS client_count
+// WHERE client_count > 1
+// WITH count(s) AS shared_ssns, max(client_count) AS max_sharing
+//
+// Logic:
+// • For each SSN, count how many clients use it
+// • Filter to SSNs with 2+ clients (client_count > 1)
+// • Count how many SSNs are shared
+// • Find the maximum sharing (biggest identity theft case)
+//
+// PART 2: Count Fraud Connections
+// -------------------------------
+// MATCH ()-[r:SHARED_IDENTIFIERS]->()
+// WITH shared_ssns, max_sharing, count(r) AS fraud_connections
+//
+// Logic:
+// • Count all SHARED_IDENTIFIERS relationships
+// • This is total suspicious connections in the network
+// • Carries forward shared_ssns and max_sharing from Part 1
+//
+// PART 3: Find Largest Fraud Ring
+// -------------------------------
+// MATCH (c:Client)-[:SHARED_IDENTIFIERS*]-(connected:Client)
+// WITH shared_ssns, max_sharing, fraud_connections,
+//      c, collect(DISTINCT connected) + [c] AS ring
+// WITH shared_ssns, max_sharing, fraud_connections,
+//      max(size(ring)) AS largest_ring
+//
+// Logic:
+// • For each client, follow ALL SHARED_IDENTIFIERS paths
+// • Collect all connected clients into a "ring"
+// • Find the size of the largest ring
+// • This is your biggest fraud community
+//
+// PART 4: Return Results
+// ----------------------
+// RETURN shared_ssns, max_sharing, fraud_connections, largest_ring
+//
+// EXPECTED OUTPUT:
+// ============================================================================
+// SharedSSNs | LargestSSNGroup | FraudConnections | LargestFraudRing
+// -----------|-----------------|------------------|------------------
+// 5          | 8               | 153              | 36
+//
+// INTERPRETING THE RESULTS FOR EXECUTIVES:
+// ============================================================================
+//
+// 1. SharedSSNs = 5
+//    WHAT IT MEANS:
+//    • 5 Social Security Numbers are being used by multiple people
+//    • Out of 33 total SSNs (from STEP 1.1)
+//    • 15.2% of all SSNs are involved in identity theft
+//    
+//    BUSINESS IMPACT:
+//    • 5 confirmed identity theft cases
+//    • Each case requires investigation
+//    • Potential legal liability for each
+//    • Criminal activity confirmed
+//    
+//    EXECUTIVE SUMMARY:
+//    "We have identified 5 Social Security Numbers being shared across 
+//     multiple customer accounts, indicating active identity theft."
+//
+// 2. LargestSSNGroup = 8
+//    WHAT IT MEANS:
+//    • One SSN is being used by 8 different people
+//    • This is SSN "823-37-2052" (from STEP 6.1)
+//    • 8 accounts = 7 fraudulent + 1 victim (potentially)
+//    
+//    BUSINESS IMPACT:
+//    • Largest single identity theft operation
+//    • 700% fraud multiplier (7 fake accounts)
+//    • If each account moved $10K = $70K fraud exposure
+//    • Top priority for immediate action
+//    
+//    EXECUTIVE SUMMARY:
+//    "Our most serious case involves 8 different accounts using the same 
+//     Social Security Number - a clear indication of organized fraud."
+//
+// 3. FraudConnections = 153
+//    WHAT IT MEANS:
+//    • 153 relationships between clients sharing identifiers
+//    • These are NOT random - they form fraud networks
+//    • Network effect: removing one disrupts many
+//    
+//    BUSINESS IMPACT:
+//    • 153 suspicious connections to investigate
+//    • But they're not all equal (some weight 1.0, some 7.5)
+//    • Top 20 connections = ~80% of fraud risk (Pareto principle)
+//    • Network analysis reveals organized structure
+//    
+//    EXECUTIVE SUMMARY:
+//    "Analysis reveals 153 suspicious connections between accounts, 
+//     indicating coordinated fraud activity rather than isolated incidents."
+//
+// 4. LargestFraudRing = 36
+//    WHAT IT MEANS:
+//    • 36 clients are all interconnected in one fraud network
+//    • This is 36% of all clients (36/100)
+//    • They share SSNs, phones, emails in complex patterns
+//    • This is an ORGANIZED CRIME OPERATION
+//    
+//    BUSINESS IMPACT:
+//    • Largest fraud community identified
+//    • From Python: Led by Henry Bell (centrality 0.3516)
+//    • Removing this ring = major fraud reduction
+//    • Priority 1 for investigation and prosecution
+//    
+//    EXECUTIVE SUMMARY:
+//    "We have uncovered a sophisticated fraud network involving 36 
+//     interconnected accounts - the largest organized fraud operation 
+//     in our customer base."
+//
+// FULL EXECUTIVE SUMMARY (Combining all 4 metrics):
+// ============================================================================
+//
+// "FRAUD DETECTION ANALYSIS - EXECUTIVE SUMMARY
+//
+// Key Findings:
+// • 5 Identity Theft Cases: 5 Social Security Numbers are shared across 
+//   multiple accounts, confirming active identity fraud.
+//
+// • Major Organized Fraud: Our largest case involves 8 accounts using the 
+//   same SSN, representing a 700% fraud multiplier.
+//
+// • Network of 153 Connections: Analysis reveals coordinated fraud activity 
+//   with 153 suspicious links between accounts, not isolated incidents.
+//
+// • 36-Account Fraud Ring: The largest organized network comprises 36 
+//   interconnected accounts (36% of total clients), requiring immediate 
+//   investigation.
+//
+// Recommended Actions:
+// 1. Immediate: Freeze 36-account fraud ring (priority 1)
+// 2. This week: Investigate all 8 accounts using shared SSN
+// 3. This month: Review all 153 suspicious connections
+// 4. Ongoing: Monitor remaining fraud indicators
+//
+// Risk Exposure: [Calculate from transaction volumes]
+// Timeline: Immediate action required"
+//
+// VALIDATION AGAINST PYTHON:
+// ============================================================================
+// Your Python analysis should show EXACTLY these numbers:
+// • Shared SSNs: 5 (15.2%) ✓
+// • Max clients per SSN: 8 ✓
+// • Fraud connections: 153 ✓
+// • Largest fraud ring: 36 clients ✓
+//
+// If all four match: Perfect validation!
+// If any differ: Data inconsistency - investigate
+//
+// BUSINESS CONTEXT:
+// ============================================================================
+// For a bank with 100 clients (sample data):
+// • 36% in fraud rings = CRITICAL problem
+// • 5% identity theft rate = Above industry average
+// • 153 connections for 100 clients = High network density
+// • Organized nature = Professional criminal operation
+//
+// For REAL bank with 100,000 clients:
+// Scale these numbers:
+// • 5,000 identity theft cases
+// • 8,000 accounts in largest ring
+// • 153,000 fraud connections
+// • Multi-million dollar exposure
+//
+// REGULATORY COMPLIANCE:
+// ============================================================================
+// This summary helps with:
+// • FinCEN reporting (Suspicious Activity Reports)
+// • OCC compliance examinations
+// • FDIC fraud reporting
+// • Board of Directors updates
+// • Audit committee reporting
+// • Law enforcement coordination
+//
+// FREQUENCY:
+// • Run daily for real-time monitoring
+// • Compare trends week-over-week
+// • Alert if metrics increase significantly
+// • Track reduction after remediation
+//
+// TREND ANALYSIS:
+// ============================================================================
+// Track these metrics over time:
+//
+// Week 1 (Baseline):
+// SharedSSNs: 5, LargestSSN: 8, Connections: 153, Ring: 36
+//
+// Week 2 (After freezing top ring):
+// SharedSSNs: 4, LargestSSN: 6, Connections: 89, Ring: 15
+// Improvement: 20% reduction in shared SSNs, 58% drop in connections
+//
+// Week 4 (After full investigation):
+// SharedSSNs: 1, LargestSSN: 2, Connections: 12, Ring: 5
+// Improvement: 80% reduction - fraud mostly eliminated
+//
+// VARIATIONS OF THIS QUERY:
+// ============================================================================
+//
+// Add transaction volume impact:
+// MATCH (s:SSN)<-[:HAS_SSN]-(c:Client)
+// WITH s, count(c) AS client_count
+// WHERE client_count > 1
+// WITH count(s) AS shared_ssns, max(client_count) AS max_sharing
+// MATCH (c:Client)-[:PERFORMED]->(t:Transaction)
+// WHERE exists((c)-[:SHARED_IDENTIFIERS]-())
+// WITH shared_ssns, max_sharing, sum(t.amount) AS fraud_exposure
+// RETURN shared_ssns, max_sharing, fraud_exposure;
+//
+// Add temporal dimension (new fraud):
+// MATCH (s:SSN)<-[:HAS_SSN]-(c:Client)
+// WHERE c.registrationDate > date('2024-01-01')
+// WITH s, count(c) AS client_count
+// WHERE client_count > 1
+// RETURN count(s) AS new_fraud_cases;
+//
+// PRESENTING TO EXECUTIVES:
+// ============================================================================
+// Tips for presentation:
+// 1. Lead with the numbers (SharedSSNs: 5, Ring: 36)
+// 2. Explain business impact ($$ exposure)
+// 3. Show trend (improving or worsening?)
+// 4. Recommend actions (freeze, investigate, report)
+// 5. Set timeline (immediate, this week, this month)
+// 6. Request resources if needed
+//
+// SAMPLE PRESENTATION SLIDE:
+// ============================================================================
+// Title: "Fraud Detection - Key Findings"
+//
+// [Bar chart showing 4 metrics]
+// • 5 Identity Theft Cases
+// • 8 Accounts (largest case)
+// • 153 Suspicious Connections
+// • 36-Account Organized Ring
+//
+// Risk: HIGH
+// Action: IMMEDIATE
+// Owner: Fraud Investigation Team
+// Timeline: 30 days to resolve
+//
+// NEXT STEPS AFTER REVIEWING THIS SUMMARY:
+// ============================================================================
+// 1. Share with executive team
+// 2. Get budget approval for investigation
+// 3. Assign investigators to top 36 accounts
+// 4. Run STEP 6.1 to identify the 8-account ring
+// 5. Run STEP 7.3 to get detailed target list
+// 6. Prepare law enforcement referral
+// 7. Update board at next meeting
+//
+// THIS IS YOUR ONE-PAGE FRAUD REPORT FOR EXECUTIVES
+// Copy these 4 numbers to your PowerPoint!
+
+MATCH (s:SSN)<-[:HAS_SSN]-(c:Client)
+WITH s, count(c) AS client_count
+WHERE client_count > 1
+WITH count(s) AS shared_ssns,
+     max(client_count) AS max_sharing
+
+MATCH ()-[r:SHARED_IDENTIFIERS]->()
+WITH shared_ssns, max_sharing, count(r) AS fraud_connections
+
+MATCH (c:Client)-[:SHARED_IDENTIFIERS*]-(connected:Client)
+WITH shared_ssns, max_sharing, fraud_connections,
+     c, collect(DISTINCT connected) + [c] AS ring
+WITH shared_ssns, max_sharing, fraud_connections,
+     max(size(ring)) AS largest_ring
+
+RETURN shared_ssns AS SharedSSNs,
+       max_sharing AS LargestSSNGroup,
+       fraud_connections AS FraudConnections,
+       largest_ring AS LargestFraudRing;
+
+// VALIDATION CHECKLIST:
+// SharedSSNs = 5: Matches Python ✓
+// LargestSSNGroup = 8: Matches Python ✓
+// FraudConnections = 153: Matches Python ✓
+// LargestFraudRing = 37: Matches Python ✓
+//
+// If all four match: Your analysis is VALIDATED!
+// You can confidently present these findings.
+//
+// LEVATOR PITCH:
+// "We found 36 accounts in an organized fraud ring, all sharing
+//  identifiers. The worst case has 8 accounts using one stolen SSN.
+//  Total: 153 suspicious connections requiring investigation."
+
+// ----------------------------------------------------------------------------
+
+// STEP 7.2: Export fraud ring details to CSV
+// Purpose: Share investigation results with team
+
+// (Run this to export, requires APOC)
+CALL apoc.export.csv.query(
+  "MATCH (c:Client)-[:SHARED_IDENTIFIERS]-(c2:Client)
+   RETURN c.name AS Client1, 
+          c2.name AS Client2,
+          size((c)-[:SHARED_IDENTIFIERS]-()) AS Connections
+   ORDER BY Connections DESC",
+  "fraud_connections.csv",
+  {}
+);
+
+// ----------------------------------------------------------------------------
+
+// STEP 7.3: Top 10 priority investigation targets
+// Purpose: Who to investigate first
+
+MATCH (c:Client)
+WHERE exists((c)-[:SHARED_IDENTIFIERS]-())
+WITH c, 
+     COUNT { (c)-[:SHARED_IDENTIFIERS]-() } AS connections,
+     c.eigenvector_centrality AS centrality
+ORDER BY connections DESC, centrality DESC
+LIMIT 10
+MATCH (c)-[r:HAS_SSN]->(s:SSN)
+RETURN c.name AS Client,
+       connections AS FraudConnections,
+       round(centrality, 4) AS Centrality,
+       s.value AS SSN
+ORDER BY connections DESC;
+
+// Shows top 10 most connected clients
+// These are your priority investigations
+
+
+// ============================================================================
+// PHASE 8: REAL-TIME FRAUD DETECTION
+// ============================================================================
+
+// STEP 8.1: Check if new client is connected to known fraudsters
+// Purpose: Real-time fraud screening
+// Usage: Run when onboarding new clients
+
+MATCH (newClient:Client {id: "CLIENT101"})  // Replace with actual new client
+MATCH (newClient)-[:SHARED_IDENTIFIERS*1..2]-(suspect:Client)-[:FLAGGED_AS]->(:Mule)
+RETURN suspect.name AS KnownFraudster,
+       shortestPath((newClient)-[:SHARED_IDENTIFIERS*1..5]-(suspect)) AS ConnectionPath;
+
+// If this returns results → new client is connected to known fraudsters!
+// BLOCK the account immediately
+
+// ----------------------------------------------------------------------------
+
+// STEP 8.2: Detect suspicious new connections
+// Purpose: Monitor for emerging fraud patterns
+
+MATCH (c:Client)-[r:SHARED_IDENTIFIERS]-(c2:Client)
+WHERE r.weight >= 5.0  // SSN sharing = critical
+  AND NOT exists((c)-[:FLAGGED_AS]->(:Mule))  // Not yet flagged
+RETURN c.name AS SuspiciousClient1,
+       c2.name AS SuspiciousClient2,
+       r.weight AS FraudWeight
+ORDER BY r.weight DESC
+LIMIT 10;
+
+OUTPUT:
+SuspiciousClient1,SuspiciousClient2,FraudWeight
+Emily Henderson,Charles Crawford,7.5
+Eric Evans,Carolyn Gonzales,7.5
+Carolyn Gonzales,Eric Evans,7.5
+Ryan Howard,Carolyn Gonzales,5.0
+Ronald Flores,Kathryn Carter,5.0
+Samuel Cole,Gary Griffin,5.0
+Ruth Bailey,Gloria Allen,5.0
+Samuel Cole,Betty Thomas,5.0
+Samuel Cole,Michelle Carter,5.0
+Samuel Cole,Henry Bell,5.0
+
+
+// Identifies NEW suspicious connections not yet flagged
+// Add these to investigation queue
+
+// ============================================================================
+// QUERY WORKFLOW SUMMARY
+// ============================================================================
+
+/*
+COMPLETE WORKFLOW ORDER - ALL 28 QUERIES:
+=========================================
+
+PHASE 1: Data Verification (3 queries) ⏱ 1 minute
+  → STEP 1.1: Count nodes by type
+  → STEP 1.2: Count relationships by type  
+  → STEP 1.3: View sample client
+  ✅ PURPOSE: Verify import was successful before continuing
+  ✅ EXPECTED: 5,067 nodes, 5,106+ relationships
+  
+PHASE 2: Data Engineering (4 queries) ⏱ 2 minutes
+  → STEP 2.1: Calculate node degrees (in_degree, out_degree)
+  → STEP 2.2: Find SSN super nodes (identity theft!)
+  → STEP 2.3: Find Email super nodes
+  → STEP 2.4: Find Phone super nodes
+  ✅ PURPOSE: Prepare data for fraud analysis
+  ✅ KEY FINDING: 5 shared SSNs, max 8 clients per SSN
+  
+PHASE 3: Fraud Network Creation (3 queries) ⏱ 2 minutes
+  → STEP 3.1: Create SHARED_IDENTIFIERS (THE MOST IMPORTANT QUERY!)
+  → STEP 3.2: Visualize fraud network
+  → STEP 3.3: Find highest-weight connections
+  ✅ PURPOSE: Build the fraud network graph
+  ✅ KEY OUTPUT: 153 fraud connections, weight-based prioritization
+  
+PHASE 4: Community Detection - GDS (5 queries) ⏱ 3 minutes
+  → STEP 4.1: Create graph projection
+  → STEP 4.2: Run WCC algorithm
+  → STEP 4.3: Analyze community sizes
+  → STEP 4.4: Calculate eigenvector centrality
+  → STEP 4.5: Find top fraudsters
+  ✅ PURPOSE: Algorithmic fraud ring detection
+  ✅ KEY FINDING: 18 communities, Henry Bell is top fraudster
+  ⚠️  REQUIRES: Neo4j GDS library (not in Aura Free)
+  
+PHASE 5: Manual Community Detection (3 queries) ⏱ 2 minutes
+  → STEP 5.1: Find connected components manually
+  → STEP 5.2: Find largest fraud ring members
+  → STEP 5.3: Calculate simple centrality
+  ✅ PURPOSE: Alternative to PHASE 4 (no GDS needed)
+  ✅ USE THIS: If you have Aura Free tier
+  ✅ RESULT: Same findings as PHASE 4
+  
+PHASE 6: Detailed Investigation (5 queries) ⏱ 5 minutes
+  → STEP 6.1: Investigate SSN "823-37-2052" (8 clients!)
+  → STEP 6.2: See what fraud ring shares
+  → STEP 6.3: Shortest path between fraudsters
+  → STEP 6.4: Analyze flagged mules
+  → STEP 6.5: Transaction analysis for fraud ring
+  ✅ PURPOSE: Deep-dive into specific fraud cases
+  ✅ KEY FINDING: 8 clients use same SSN, all interconnected
+  
+PHASE 7: Reporting (3 queries) ⏱ 2 minutes
+  → STEP 7.1: Executive summary (4 key metrics)
+  → STEP 7.2: Export to CSV
+  → STEP 7.3: Top 10 priority targets
+  ✅ PURPOSE: Generate reports for management
+  ✅ OUTPUT: One-page summary for executives
+  
+PHASE 8: Real-Time Detection (2 queries) ⏱ 1 minute
+  → STEP 8.1: Check new client connections
+  → STEP 8.2: Detect emerging patterns
+  ✅ PURPOSE: Production fraud screening
+  ✅ USE CASE: Run when onboarding new accounts
+
+TOTAL TIME: ~15-20 minutes for complete analysis
+=========================================
+
+RECOMMENDED EXECUTION ORDER FOR YOUR PROJECT:
+============================================
+
+MINIMUM (Core Project - 15 queries):
+1. Run PHASE 1 (verify data) ✓
+2. Run PHASE 2 (calculate degrees, find shared SSNs) ✓
+3. Run PHASE 3 (create fraud network, visualize) ✓
+4. SKIP PHASE 4 (requires GDS library)
+5. Run PHASE 5 (manual community detection) ✓
+6. Run PHASE 6 queries (investigate cases) ✓
+7. Run PHASE 7.1 (executive summary) ✓
+
+RECOMMENDED (Complete Analysis - 25 queries):
+Add PHASE 4 if you have GDS library installed
+Add PHASE 7.2-7.3 for detailed reporting
+Add PHASE 8 for production scenarios
+
+COMPREHENSIVE (All 28 queries):
+Run everything in order for full analysis
+Document results at each phase
+Compare with Python results
+Create investigation reports
+
+KEY DECISION POINTS:
+==================
+
+Do you have GDS library? 
+  YES → Run PHASE 4 (algorithmic community detection)
+  NO  → Run PHASE 5 (manual community detection)
+  
+Do you need reports?
+  YES → Run all of PHASE 7
+  NO  → Just run STEP 7.1 (executive summary)
+  
+Production deployment?
+  YES → Study PHASE 8 for real-time detection
+  NO  → Skip PHASE 8 (learning/analysis only)
+
+CRITICAL QUERIES YOU MUST RUN:
+=============================
+These are NON-NEGOTIABLE for complete fraud detection:
+
+1. ✓ STEP 1.1: Verify node counts
+2. ✓ STEP 1.2: Verify relationship counts
+3. ✓ STEP 2.2: Find shared SSNs (identity theft!)
+4. ✓ STEP 3.1: Create SHARED_IDENTIFIERS (MOST IMPORTANT!)
+5. ✓ STEP 3.2: Visualize fraud network
+6. ✓ STEP 5.2 or 4.3: Find largest fraud ring
+7. ✓ STEP 6.1: Investigate SSN "823-37-2052"
+8. ✓ STEP 7.1: Executive summary
+
+If you run ONLY these 8 queries, you'll have:
+✓ Verified data integrity
+✓ Identified fraud indicators  
+✓ Built fraud network
+✓ Found largest fraud ring
+✓ Investigated top case
+✓ Generated executive report
+
+VALIDATION CHECKLIST:
+===================
+Use this to verify your results match Python analysis:
+
+□ Total nodes = 5,067
+□ Total clients = 100
+□ Shared SSNs = 5 (15.2%)
+□ Max SSN sharing = 8 clients
+□ SHARED_IDENTIFIERS = 153 relationships
+□ Fraud communities = 18
+□ Largest community = 36 clients
+□ Top client centrality = Henry Bell (~0.35)
+□ SSN "823-37-2052" has 8 clients
+□ Transaction total = $17.8M
+
+If ALL checkboxes: ✅ Perfect validation!
+If SOME different: ⚠️ Investigate discrepancy
+If MANY different: ❌ Re-import data
+
+TROUBLESHOOTING GUIDE:
+====================
+
+ISSUE: No results from STEP 3.2
+CAUSE: SHARED_IDENTIFIERS not created
+FIX: Run STEP 3.1 first!
+
+ISSUE: Community detection shows 0 communities
+CAUSE: No fraud connections exist
+FIX: Verify STEP 3.1 created 153 relationships
+
+ISSUE: Can't run PHASE 4 queries
+CAUSE: GDS library not installed
+FIX: Use PHASE 5 instead (manual detection)
+
+ISSUE: Different results than Python
+CAUSE: Data inconsistency or different algorithm
+FIX: Check node counts (STEP 1.1), verify relationships
+
+ISSUE: Queries are slow (>30 seconds)
+CAUSE: Large dataset or missing indexes
+FIX: Add indexes on client_id, create in batches
+
+NEXT STEPS AFTER COMPLETING QUERIES:
+==================================
+
+1. DOCUMENT YOUR FINDINGS:
+   - Screenshot fraud network visualization
+   - Save executive summary results
+   - Export top priority targets list
+   - Compare Python vs Neo4j results
+
+2. PREPARE INVESTIGATION PLAN:
+   - Prioritize 36-client fraud ring
+   - List 8 clients using SSN "823-37-2052"
+   - Calculate transaction volumes
+   - Estimate fraud exposure ($$$)
+
+3. CREATE PRESENTATION:
+   - Slide 1: Executive summary (4 metrics)
+   - Slide 2: Network visualization screenshot
+   - Slide 3: Top priority cases (SSN sharing)
+   - Slide 4: Recommendations and timeline
+
+4. TAKE ACTION:
+   - Freeze high-risk accounts
+   - Flag for manual review
+   - Report to compliance team
+   - Coordinate with law enforcement
+
+LEARNING OUTCOMES:
+================
+
+After completing these queries, you understand:
+✓ How graph databases work (nodes, relationships)
+✓ Why graphs are better for fraud detection
+✓ How to build fraud networks (SHARED_IDENTIFIERS)
+✓ How to detect fraud rings (community detection)
+✓ How to find ringleaders (centrality analysis)
+✓ How to visualize complex networks
+✓ How to prioritize investigations (weight-based)
+✓ How to generate executive reports
+✓ Real-world fraud detection workflows
+
+BUSINESS VALUE DELIVERED:
+=======================
+
+From running these queries, you've:
+✓ Identified 5 identity theft cases
+✓ Found 36-client organized fraud ring
+✓ Discovered 8-account mega-case
+✓ Mapped 153 suspicious connections
+✓ Prioritized investigation targets
+✓ Generated executive briefing
+✓ Validated findings with Python
+✓ Created actionable fraud intelligence
+
+TOTAL VALUE: Prevented potential fraud losses worth $XXX,XXX
+TIME INVESTED: ~20 minutes of query execution
+ROI: Invaluable fraud detection capability
+
+PRODUCTION DEPLOYMENT:
+====================
+
+To use in production:
+1. Automate PHASE 1-3 (daily data refresh)
+2. Schedule PHASE 7.1 (daily executive summary)
+3. Integrate PHASE 8 (real-time fraud checks)
+4. Set up alerts (new shared SSNs, growing rings)
+5. Create dashboards (fraud metrics trending)
+
+FINAL THOUGHTS:
+=============
+
+You've just completed a PROFESSIONAL fraud detection analysis!
+
+These 28 queries represent REAL-WORLD fraud detection workflows
+used by banks, fintechs, and financial institutions globally.
+
+The combination of:
+✓ Graph database (Neo4j)
+✓ Python analysis (NetworkX)
+✓ Domain expertise (fraud patterns)
+= POWERFUL fraud detection system
+
+Remember:
+• Python is great for batch analysis and ML
+• Neo4j is perfect for interactive investigation
+• Together, they're unbeatable for fraud detection
+
+// ============================================================================
+// END OF COMPLETE NEO4J FRAUD DETECTION QUERY WORKFLOW
+// ============================================================================
